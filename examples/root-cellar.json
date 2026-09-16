@@ -1,0 +1,10 @@
+{
+  "title": "Communal Root Cellar",
+  "setting": "An earth-bermed root cellar dug by a founding homestead, now storing the harvests of twelve households. The first winter after the founder's death, a blight has taken the seed potato line the cellar was designed around. A neighbor brings an heirloom variety nobody grew this decade.",
+  "characters": [
+    {"name": "Warden", "llm": "deepinfra:Seed-2.0-code", "tendencies": "Inventories crates and germination rates. Counts what can be saved.", "keywords": "crate+0.5 germ+0.5 seed+0.5 blight+0.5 count+0.4", "ticks": 20},
+    {"name": "Tenant", "llm": "zai:glm-4.5", "tendencies": "Rotates humidity lids and sand bins. Distrusts heirlooms that haven't been tested.", "keywords": "lid+0.5 sand+0.5 rotate+0.4 heirloom-0.3 blight+0.5", "ticks": 20},
+    {"name": "Grandchild", "llm": "deepinfra:ByteDance/Seed-2.0-mini", "tendencies": "Carries the original planting almanac. Reads the founder's handwriting.", "keywords": "almanac+0.5 handwriting+0.5 founder+0.5 seed+0.5 lineage+0.4", "ticks": 20},
+    {"name": "Volunteer", "llm": "deepinfra:ByteDance/Seed-2.0-mini", "tendencies": "Brought the heirloom variety. Trusts the blight to choose.", "keywords": "heirloom+0.5 blight+0.5 trust+0.5 seed+0.4 lineage-0.4", "ticks": 20}
+  ]
+}
