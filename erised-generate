@@ -3,7 +3,7 @@
 erised-generate — operator-side authoring helper.
 
 Given a free-text prompt (the dilemma), output a starter scenario JSON.
-Uses Qwen (cheap). One call.
+Uses Qwen (cheap). One call. Output is JSON-only with a clean exit.
 
 Usage:
   ./erised-generate "a community library with no official books"
@@ -11,7 +11,7 @@ Usage:
 """
 import os, sys, json, argparse, urllib.request, urllib.error
 
-def call_qwen(prompt, system, max_tokens=1500):
+def call_qwen(prompt, system, max_tokens=1500, timeout=80):
     key = os.environ.get("DEEPINFRA_TOKEN") or os.environ.get("DEEP_TOKEN")
     body = json.dumps({
         "model": "Qwen/Qwen3-235B-A22B-Instruct-2507",
@@ -22,7 +22,7 @@ def call_qwen(prompt, system, max_tokens=1500):
         "https://api.deepinfra.com/v1/openai/chat/completions",
         data=body,
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=90) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         d = json.loads(r.read())
     return (d.get("choices", [{}])[0].get("message", {}).get("content")
             or d.get("choices", [{}])[0].get("message", {}).get("reasoning_content")
@@ -39,12 +39,37 @@ Constraints:
 - ticks: 20 each
 - Cast roles: at least one Operator, one Counter, one Voice, optionally one Emergent
 
-Output ONLY valid JSON, no preamble, no markdown code fences."""
+Output ONLY valid JSON, no preamble, no markdown code fences. End with the closing brace."""
+
+def extract_first_json(text):
+    """Find the first complete JSON object in the text."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1]
+        if "```" in text:
+            text = text[:text.rindex("```")]
+    decoder = json.JSONDecoder()
+    try:
+        obj, end = decoder.raw_decode(text)
+        return obj
+    except json.JSONDecodeError:
+        return None
+
+def normalize_scenario(d):
+    """Convert keywords dict → "word+0.5,word-0.3" string format if needed."""
+    for c in d.get("characters", []):
+        kw = c.get("keywords")
+        if isinstance(kw, dict):
+            c["keywords"] = ",".join(f"{k}{'+' if v>=0 else ''}{v}" for k, v in kw.items())
+        # Add default ticks if missing
+        c.setdefault("ticks", 20)
+    return d
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("prompt", help="Free-text dilemma")
     ap.add_argument("--out", help="output file")
+    ap.add_argument("--pretty", action="store_true", default=True)
     args = ap.parse_args()
 
     if not (os.environ.get("DEEPINFRA_TOKEN") or os.environ.get("DEEP_TOKEN")):
@@ -52,28 +77,20 @@ def main():
         sys.exit(1)
 
     text = call_qwen(args.prompt, SYSTEM, max_tokens=1800)
-    # Strip any code fences if present
-    text = text.strip()
-    if text.startswith("```"):
-        # find first newline, take everything after, strip closing fence
-        text = text.split("\n", 1)[1]
-        if text.endswith("```"):
-            text = text[:-3]
-    try:
-        scenario = json.loads(text)
-    except json.JSONDecodeError as e:
-        # Output the raw text — let the operator see what came back
-        print("WARN: could not parse JSON", file=sys.stderr)
+    scenario = extract_first_json(text)
+    if scenario is None:
+        print("WARN: could not parse JSON, returning raw", file=sys.stderr)
         sys.stdout.write(text)
-        return
-
-    out = json.dumps(scenario, indent=2)
+        sys.exit(0)
+    scenario = normalize_scenario(scenario)
+    out = json.dumps(scenario, indent=2 if args.pretty else None)
     if args.out:
         with open(args.out, "w") as f:
             f.write(out + "\n")
         print(f"Wrote {args.out}", file=sys.stderr)
     else:
         sys.stdout.write(out + "\n")
+    sys.exit(0)  # force-exit to avoid hanging
 
 if __name__ == "__main__":
     main()
