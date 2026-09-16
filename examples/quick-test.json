@@ -1,0 +1,20 @@
+{
+  "title": "Quick 2-character test",
+  "setting": "Two engineers. One server room. Three minutes before the deploy window closes. They have not met before.",
+  "characters": [
+    {
+      "name": "Builder",
+      "llm": "zai:glm-4.5",
+      "tendencies": "Ships the code. Watches for regressions.",
+      "keywords": "ship+0.5 deploy+0.5 spec+0.4 lock+0.4",
+      "ticks": 20
+    },
+    {
+      "name": "Auditor",
+      "llm": "deepinfra:ByteDance/Seed-2.0-code",
+      "tendencies": "Counts the diffs. Double-entry.",
+      "keywords": "ledger+0.5 cite+0.5 diff+0.4 audit+0.4",
+      "ticks": 20
+    }
+  ]
+}
