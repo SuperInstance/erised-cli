@@ -79,9 +79,15 @@ def call_llm(llm_str, prompt, system, max_tokens=600):
 def parse_keywords(s):
     out = {}
     if not s: return out
-    for part in re.split(r"[,\n;]+", str(s)):
-        m = re.search(r"(\S+?)\s*(?:→|=|)\s*([+-]?\s*\d*\.?\d+)", part)
-        if m: out[m.group(1).strip().lower()] = float(m.group(2).replace(" ",""))
+    if isinstance(s, dict): return s  # already parsed
+    # Split on common separators (comma, semicolon, newline, or space-before-letter)
+    for part in re.split(r"[,\n;]+|\s+(?=[a-z])", str(s)):
+        part = part.strip()
+        if not part: continue
+        m = re.search(r"^(\S+?)([+-])\s*(\d*\.?\d+)\s*$", part)
+        if m:
+            sign = 1 if m.group(2) == "+" else -1
+            out[m.group(1).strip().lower()] = sign * float(m.group(3))
     return out
 
 def score_shifts(text, keywords):
