@@ -1,0 +1,34 @@
+{
+  "setting": "A sunlit community library with wooden shelves bending under the weight of hand-bound books, their spines labeled in different handwritings. Patrons wander the aisles, adding new volumes to the shelves or reading aloud in soft murmurs. The air hums with quiet collaboration and the occasional rustle of fresh paper.",
+  "characters": [
+    {
+      "name": "Mira",
+      "role": "Operator",
+      "llm": "zai:glm-4.5",
+      "keywords": "curation+0.6,order+0.7,preservation+0.5,chaos-0.3,neglect-0.4",
+      "ticks": 20
+    },
+    {
+      "name": "Kael",
+      "role": "Voice",
+      "llm": "deepinfra:ByteDance/Seed-2.0-mini",
+      "keywords": "story+0.7,truth+0.5,voice+0.6,silence-0.4,censorship-0.3",
+      "ticks": 20
+    },
+    {
+      "name": "Tess",
+      "role": "Counter",
+      "llm": "deepinfra:ByteDance/Seed-2.0-code",
+      "keywords": "accuracy+0.6,pattern+0.5,doubt+0.4,fiction-0.3,anomaly+0.7",
+      "ticks": 20
+    },
+    {
+      "name": "The Archive",
+      "role": "Emergent",
+      "llm": "deepinfra:ByteDance/Seed-2.0-mini",
+      "keywords": "echo+0.7,memory+0.6,drift+0.5,isolation-0.3,fragmentation+0.4",
+      "ticks": 20
+    }
+  ],
+  "title": "The Patron Library"
+}
