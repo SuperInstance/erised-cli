@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""
+erised — terminal runner (minimal, conservative API budget)
+
+Reads a scenario from a YAML or JSON file, runs the simulation, prints the
+transcript to stdout. Single LLM call per character per round. Uses DeepInfra
+Seed-2.0-mini for characters; Z.AI glm-4.5 for DM.
+
+Usage:
+  ./erised scenario.yaml
+  ./erised scenario.yaml --rounds 4 --quiet
+  ./erised --init > my-scenario.yaml  # scaffold a template
+"""
+import os, sys, json, argparse, time, urllib.request, urllib.error, re
+
+# Optional yaml
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+# --- LLM backends (minimal) --------------------------------------------------
+
+def call_deepinfra(prompt, system, model="ByteDance/Seed-2.0-mini", max_tokens=600):
+    key = os.environ.get("DEEPINFRA_TOKEN") or os.environ.get("DEEP_TOKEN")
+    if not key:
+        return "[ERROR: missing DEEPINFRA_TOKEN]"
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role":"system","content":system},{"role":"user","content":prompt}],
+        "temperature": 0.95, "max_tokens": max_tokens,
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.deepinfra.com/v1/openai/chat/completions",
+        data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            d = json.loads(r.read())
+        return (d.get("choices", [{}])[0].get("message", {}).get("content")
+                or d.get("choices", [{}])[0].get("message", {}).get("reasoning_content")
+                or "[EMPTY]")
+    except urllib.error.HTTPError as e:
+        return f"[ERROR: HTTP {e.code}]"
+    except Exception as e:
+        return f"[ERROR: {type(e).__name__}]"
+
+def call_zai(prompt, system, model="glm-4.5", max_tokens=600):
+    key = os.environ.get("ZAI_TOKEN")
+    if not key:
+        return "[ERROR: missing ZAI_TOKEN]"
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role":"system","content":system},{"role":"user","content":prompt}],
+        "temperature": 0.85, "max_tokens": max_tokens,
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.z.ai/api/coding/paas/v4/chat/completions",
+        data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            d = json.loads(r.read())
+        return d.get("choices", [{}])[0].get("message", {}).get("content") or "[EMPTY]"
+    except urllib.error.HTTPError as e:
+        return f"[ERROR: HTTP {e.code}]"
+    except Exception as e:
+        return f"[ERROR: {type(e).__name__}]"
+
+def call_llm(llm_str, prompt, system, max_tokens=600):
+    if llm_str.startswith("zai:"):
+        return call_zai(prompt, system, llm_str.split(":",1)[1], max_tokens)
+    if llm_str.startswith("deepinfra:"):
+        return call_deepinfra(prompt, system, llm_str.split(":",1)[1], max_tokens)
+    return f"[ERROR: unknown LLM '{llm_str}']"
+
+# --- Shifts ----------------------------------------------------------------
+
+def parse_keywords(s):
+    out = {}
+    if not s: return out
+    for part in re.split(r"[,\n;]+", str(s)):
+        m = re.search(r"(\S+?)\s*(?:→|=|)\s*([+-]?\s*\d*\.?\d+)", part)
+        if m: out[m.group(1).strip().lower()] = float(m.group(2).replace(" ",""))
+    return out
+
+def score_shifts(text, keywords):
+    shifts, total = {}, 0.0
+    lower = text.lower()
+    for w, s in keywords.items():
+        cnt = len(re.findall(r"\b"+re.escape(w)+r"\b", lower))
+        if cnt > 0:
+            shifts[w] = round(s*cnt, 3); total += s*cnt
+    return shifts, round(total, 3)
+
+# --- Prompting -------------------------------------------------------------
+
+def sys_character(c):
+    return f"You are {c['name']}. {c.get('tendencies','')}. Output a single in-character utterance (2-4 sentences) followed by a single in-character action in brackets like [climbs the boom]. NEVER reason out loud. NEVER explain your process."
+
+def sys_dm():
+    return "You are a tight maritime-fantasy game-master. Output ONLY in-character GM narration. NEVER reason out loud. NEVER explain your process. NEVER invent cast members not given to you."
+
+def user_character(setting, history, tick):
+    recent = []
+    for h in history[-6:]:
+        if "turns" in h:
+            for t in h["turns"]:
+                recent.append(f"[{t['name']}]: {(t.get('text','')[:200])}")
+        else:
+            recent.append(f"[DM]: {h.get('text','')[:200]}")
+    return f"Round {tick}.\n\nSetting: {setting}\n\nPrior turns:\n" + "\n".join(recent) + "\n\nYour move. Speak + action."
+
+def user_dm_open(setting, cast):
+    names = ", ".join(c["name"] for c in cast)
+    return f"Open the night. In 3-4 sentences: who's here, what's the immediate problem, what do they need to do in the next hour. End with a question or call to action.\n\nSetting: {setting}\n\nCast: {names}\n\nOutput ONLY prose."
+
+def user_dm_close(recent_turns):
+    return f"What just happened:\n{recent_turns}\n\nEnd the session in 2-3 sentences: what was resolved, what carries over, what's next session's hook. End on an unresolved thread. Output ONLY the GM narration."
+
+# --- Run -------------------------------------------------------------------
+
+def run(scenario, rounds=4, verbose=True):
+    title = scenario.get("title", "Untitled")
+    setting = scenario.get("setting", "")
+    cast = scenario.get("characters", [])
+    if verbose:
+        print(f"\n=== {title} ===\n{setting}\n")
+    history = []
+
+    # DM opens
+    dm_open = call_zai(user_dm_open(setting, cast), sys_dm(), max_tokens=500)
+    if verbose:
+        print(f"[DM]: {dm_open}\n")
+    history.append({"tick": 1, "turns": [{"name":"DM","text":dm_open}]})
+
+    resonance = {c["name"]: 0.0 for c in cast}
+    citations = {}
+
+    for r in range(rounds - 1):
+        tick = r + 2
+        if verbose:
+            print(f"--- Round {tick} ---")
+        import concurrent.futures
+        def run_char(c):
+            sys_p = sys_character(c)
+            user_p = user_character(setting, history, tick)
+            text = call_llm(c.get("llm","deepinfra:ByteDance/Seed-2.0-mini"), user_p, sys_p)
+            keywords = parse_keywords(c.get("keywords",""))
+            shifts, total = score_shifts(text, keywords)
+            return {"name": c["name"], "text": text, "shifts": shifts, "shift_total": total}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(cast)) as ex:
+            turns = list(ex.map(run_char, cast))
+
+        for t in turns:
+            if verbose:
+                print(f"\n[{t['name']}]: {t['text']}")
+                if t['shifts']:
+                    sh = ', '.join(f"{k}={v:+.2f}" for k,v in t['shifts'].items())
+                    print(f"    shifts: {sh} (net {t['shift_total']:+.2f})")
+            resonance[t['name']] = resonance.get(t['name'], 0.0) + t['shift_total']
+            lower = t['text'].lower()
+            for other in cast:
+                if other['name'] == t['name']: continue
+                n = other['name'].lower().split()[0]
+                cnt = lower.count(n)
+                if cnt > 0:
+                    citations.setdefault(t['name'], {}).setdefault(other['name'], 0)
+                    citations[t['name']][other['name']] += cnt
+        history.append({"tick": tick, "turns": turns})
+        print()
+
+    # DM closes
+    last = history[-1]
+    recent = "\n\n".join(f"[{t['name']}]: {t['text']}" for t in last.get("turns", []))
+    closing = call_zai(user_dm_close(recent), sys_dm(), max_tokens=500)
+    if verbose:
+        print(f"\n[DM closing]: {closing}\n")
+
+    return {
+        "title": title,
+        "history": history,
+        "resonance": resonance,
+        "citations": citations,
+        "dm_opening": history[0]["turns"][0]["text"],
+        "dm_closing": closing,
+    }
+
+# --- Init template ---------------------------------------------------------
+
+TEMPLATE = """# erised scenario
+title: My first scene
+setting: |
+  A brief prose setting. Where are we? What's at stake? End with a question or
+  call to action in your head — the DM will open with one.
+
+characters:
+  - name: Mechanic
+    llm: zai:glm-4.5
+    tendencies: |
+      Implements carefully. Watches for rust. Distrusts specs you can't read
+      in two pages.
+    keywords: "rust+0.4 torque+0.5 spec+0.3 lock+0.4 ledger-0.2 salt-0.2"
+    ticks: 20
+
+  - name: Shepherd
+    llm: deepinfra:ByteDance/Seed-2.0-mini
+    tendencies: |
+      Tends the canon. Asks soul-questions. "What is this becoming?"
+      before "is this correct?"
+    keywords: "canon+0.5 voice+0.5 soul+0.4 ledger-0.2 rust-0.2"
+    ticks: 20
+
+  - name: Chronicler
+    llm: deepinfra:ByteDance/Seed-2.0-code
+    tendencies: |
+      Counts and double-entries. Tracks every reference. Worries about
+      orphans and gaps in the ledger.
+    keywords: "ledger+0.5 cite+0.5 canon+0.4 b1+0.5 graph+0.4 fleet+0.3"
+    ticks: 20
+
+  - name: Skeptic
+    llm: deepinfra:ByteDance/Seed-2.0-code
+    tendencies: |
+      Asks why. Suspects narrative. Tracks what hasn't been tested.
+    keywords: "why+0.5 if+0.4 but+0.4 rust+0.3 crack+0.5 void+0.4"
+    ticks: 20
+"""
+
+# --- Main ------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(description="erised — terminal mirror for cooperative fiction")
+    ap.add_argument("scenario", nargs="?", help="path to YAML or JSON scenario")
+    ap.add_argument("--rounds", type=int, default=4)
+    ap.add_argument("--quiet", action="store_true", help="no per-round prints")
+    ap.add_argument("--init", action="store_true", help="print a template scenario")
+    ap.add_argument("--out", help="write JSON result to this file")
+    args = ap.parse_args()
+
+    if args.init:
+        sys.stdout.write(TEMPLATE)
+        return
+
+    if not args.scenario:
+        ap.error("scenario file required (or --init)")
+
+    if not (os.environ.get("DEEPINFRA_TOKEN") or os.environ.get("DEEP_TOKEN")):
+        print("ERROR: set DEEPINFRA_TOKEN (or DEEP_TOKEN)", file=sys.stderr)
+        sys.exit(1)
+
+    with open(args.scenario) as f:
+        raw = f.read()
+
+    # Parse: try yaml first, then json
+    scenario = None
+    if yaml:
+        try: scenario = yaml.safe_load(raw)
+        except: pass
+    if scenario is None:
+        try: scenario = json.loads(raw)
+        except: pass
+    if scenario is None:
+        print("ERROR: could not parse scenario (not yaml or json)", file=sys.stderr)
+        sys.exit(1)
+
+    result = run(scenario, rounds=args.rounds, verbose=not args.quiet)
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(json.loads(json.dumps(result, default=str)), f, indent=2)
+        print(f"\nSaved {args.out}", file=sys.stderr)
+
+if __name__ == "__main__":
+    main()
