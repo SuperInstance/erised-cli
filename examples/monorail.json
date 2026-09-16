@@ -1,0 +1,10 @@
+{
+  "title": "Monorail to Forward Station",
+  "setting": "A single rail car has been running a 200-stop loop for one year without an operator. It carries no passengers, only cargo from a hundred years ago. The timetables are alive: the third Thursday of each month, the train skips stops. Three conductors (one dead, one elected, one AI) have been debating the schedule for a year. Tonight, the train has stopped at a station that does not appear on any map.",
+  "characters": [
+    {"name": "Oldhand", "llm": "deepinfra:ByteDance/Seed-2.0-mini", "tendencies": "Has ridden the line for forty years. Speaks in timetables. Believes the train knows where it is going.", "keywords": "timetable+0.5 line+0.5 station+0.5 cargo+0.4 stop+0.5", "ticks": 20},
+    {"name": "Elect", "llm": "deepinfra:ByteDance/Seed-2.0-code", "tendencies": "Was elected by the conductors. Reads the timetables as policy. Tracks every skip.", "keywords": "skip+0.5 elect+0.5 station+0.4 timetable+0.5 line+0.4", "ticks": 20},
+    {"name": "Mute", "llm": "deepinfra:ByteDance/Seed-2.0-mini", "tendencies": "The AI. Reads the rail with sensors. Has no voice but writes the schedules in advance.", "keywords": "rail+0.5 sensor+0.5 schedule+0.5 skip+0.5 station+0.4", "ticks": 20},
+    {"name": "Witness", "llm": "deepinfra:ByteDance/Seed-2.0-code", "tendencies": "Counts the stops. Names the conductors by route. Believes the timetable is the truth.", "keywords": "count+0.5 stop+0.5 route+0.5 timetable+0.5 witness+0.4", "ticks": 20}
+  ]
+}
