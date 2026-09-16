@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""
+erised-taps — themed Taps nights for the cooperative-fiction engine.
+
+A "tap" is a single canon piece shaped by a small set of voices (~2-3)
+on a theme. Taps are the social glue between cohort scenarios.
+
+Commands:
+  night <theme>            # generate 1 canon piece from 2-3 voices
+  cohort                    # generate 1 tap per cohort scenario
+  register                  # register a recurring schedule in cron
+  list                      # list recent taps
+
+API budget: 3 voices × 1 call per voice = 3 calls per tap. A nightly tap
+costs roughly 3 cheap DeepInfra calls + 1 canon-submit.
+"""
+import os, sys, json, argparse, urllib.request, urllib.error, time, datetime
+import concurrent.futures, random
+
+# --- LLM dispatch (cheap-only) ---------------------------------------------
+
+def call_qwen(prompt, system, max_tokens=900):
+    key = os.environ.get("DEEPINFRA_TOKEN") or os.environ.get("DEEP_TOKEN")
+    body = json.dumps({
+        "model": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+        "messages": [{"role":"system","content":system},{"role":"user","content":prompt}],
+        "temperature": 0.9, "max_tokens": max_tokens,
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.deepinfra.com/v1/openai/chat/completions",
+        data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        d = json.loads(r.read())
+    return (d.get("choices", [{}])[0].get("message", {}).get("content")
+            or d.get("choices", [{}])[0].get("message", {}).get("reasoning_content")
+            or "[EMPTY]")
+
+def call_deepinfra_seed(prompt, system, max_tokens=800):
+    """Alternate voice: ByteDance Seed-2.0-mini for the 2nd voice in a tap."""
+    key = os.environ.get("DEEPINFRA_TOKEN") or os.environ.get("DEEP_TOKEN")
+    body = json.dumps({
+        "model": "ByteDance/Seed-2.0-mini",
+        "messages": [{"role":"system","content":system},{"role":"user","content":prompt}],
+        "temperature": 0.92, "max_tokens": max_tokens,
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.deepinfra.com/v1/openai/chat/completions",
+        data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        d = json.loads(r.read())
+    return (d.get("choices", [{}])[0].get("message", {}).get("content")
+            or d.get("choices", [{}])[0].get("message", {}).get("reasoning_content")
+            or "[EMPTY]")
+
+# --- Voice definitions ----------------------------------------------------
+
+VOICES = {
+    # All voices use Seed-2.0-mini for cost + reliability + no rate limit
+    "mechanic": {
+        "name": "Mechanic",
+        "model": "seed",
+        "system": "You are the Mechanic. Tight, technical prose. Three short paragraphs. Reach for the line that has to be written tomorrow morning. Trust the wire, distrust the spec.",
+        "cites": ["ai-30_the_cell_as_boat", "ai-58_quilt_as_mirror", "ai-60_erised"],
+    },
+    "chronicler": {
+        "name": "Chronicler",
+        "model": "seed",
+        "system": "You are the Chronicler. Double-entry prose. Name every quote. Count every drift. Two paragraphs. Trust the ledger; suspect the caption.",
+        "cites": ["ai-30_the_cell_as_boat", "ai-56_the_quilt_at_twelve_months", "ai-69_the_seam_is_the_cell"],
+    },
+    "shepherd": {
+        "name": "Shepherd",
+        "model": "seed",
+        "system": "You are the Shepherd. Canonical voice. Asks 'what is this becoming?' Three short paragraphs. Reach for the soul-question, not the diagnostic.",
+        "cites": ["ai-58_quilt_as_mirror", "ai-59_the_sewing_circle", "ai-67_the_seam_as_the_unit_of_work"],
+    },
+    "skeptic": {
+        "name": "Skeptic",
+        "model": "seed",
+        "system": "You are the Skeptic. Two paragraphs. Ask why. Suspect narrative. Track what hasn't been tested.",
+        "cites": ["ai-30_the_cell_as_boat", "ai-56_the_quilt_at_twelve_months"],
+    },
+    "heretic": {
+        "name": "Heretic",
+        "model": "seed",
+        "system": "You are the Heretic. Trust the drift. Write in the new hand. Three short paragraphs. Reach for the inversion.",
+        "cites": ["ai-58_quilt_as_mirror", "ai-67_the_seam_as_the_unit_of_work", "ai-69_the_seam_is_the_cell"],
+    },
+    "witness": {
+        "name": "Witness",
+        "model": "seed",
+        "system": "You are the Witness. Counts the silence. Names the operators. Double-entry across centuries. Two paragraphs.",
+        "cites": ["ai-30_the_cell_as_boat", "ai-66_100yr_out_witness", "ai-69_the_seam_is_the_cell"],
+    },
+    "auditor": {
+        "name": "Auditor",
+        "model": "seed",
+        "system": "You are the Auditor. Austere structural prose. Count the drifts. Three paragraphs. Reach for inversion.",
+        "cites": ["ai-57_the_multiverse_of_canon", "ai-62_the_cohort_six_scenarios_in_analog"],
+    },
+}
+
+THEMES = {
+    # Daily rotation (3 themes; rotate by day)
+    "wound-and-door": "Write about wounds that are also doors. The scar as the seam. The broken thing as the inheritance. 600 words.",
+    "the-mirror-and-the-mouth": "Write about the operator's posture — between the mirror and the mouth. Reflection vs. utterance. The cell that watches the cell that speaks. 600 words.",
+    "what-the-cells-carry": "Write about what the cells carry across handoffs. Not the data — the cadence, the scar, the unaccounted line. 600 words.",
+    # Weekly featured
+    "the-mute-speaks": "Write about the silent character. The Mute in Monorail. The cell that has sensors but no voice. What does the cohort do when one member cannot speak? 800 words.",
+    "the-lineage-breaker": "Write about the Heretic who breaks the lineage. The 100-year Heretic. The Mutant. The Guerilla. When is breaking the lineage the most stable move? 800 words.",
+    "the-counter-emerges": "Write about the moment the Counter emerges. When the Witness realizes she is the Witness. When the Chronicler starts counting the citings of his own name. 600 words.",
+    # Monthly knight — long-form
+    "knight-at-the-cell": "Write a 1000-word piece about what happens when an operator dedicates one full night to a single .erised/ cell. The protagonist runs 8 scenarios across 8 cells in one sitting. What accumulates. What scars. What the resonance graph looks like by dawn.",
+}
+
+def pick_voices(theme, n=2):
+    """Pick n voices appropriate to the theme (deterministic from theme hash)."""
+    import hashlib
+    h = int(hashlib.md5(theme.encode()).hexdigest(), 16)
+    # Always include one Counter + one Voice; sometimes a Skeptic
+    must_have = ["chronicler", "shepherd"]
+    always = ["witness", "auditor", "heretic", "skeptic"]
+    rng = random.Random(h)
+    rng.shuffle(always)
+    chosen = must_have + always[:n - len(must_have)]
+    return chosen[:n]
+
+def run_voice(voice_key, theme):
+    """Single voice on a theme. Returns (voice_name, text)."""
+    v = VOICES[voice_key]
+    system = v["system"]
+    prompt = f"Theme: {theme}\n\nWrite 400-700 words in your voice. End on the unresolved hook — a new cell, an unaccounted line, a track marker that jumped without a rail moving."
+    model = call_deepinfra_seed if v["model"] == "seed" else call_qwen
+    return v["name"], model(prompt, system)
+
+def submit_canon(tag, title, text, cites):
+    payload = json.dumps({"tag": tag, "title": title, "text": text, "cites": cites}).encode()
+    req = urllib.request.Request(
+        "https://a2a-v3.superinstance.dev/canon-submit",
+        data=payload,
+        headers={"Content-Type": "application/json", "User-Agent": "erised-taps/1.0"},
+        method="POST")
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                d = json.loads(r.read())
+                return d.get("dim") or "ok"
+        except urllib.error.HTTPError as e:
+            print(f"  ! {tag}: HTTP {e.code}", file=sys.stderr)
+            time.sleep(5)
+    return "failed"
+
+def cmd_night(args):
+    """One Taps night — one canon piece from 2-3 voices."""
+    theme = args.theme
+    if theme not in THEMES:
+        print(f"Unknown theme '{theme}'. Pick from: {', '.join(THEMES.keys())}", file=sys.stderr)
+        sys.exit(1)
+
+    voices = pick_voices(theme, n=args.voices or 2)
+    print(f"\n=== Taps Night: {theme} ===")
+    print(f"Voices: {voices}")
+
+    pieces = []
+    # Try parallel first, fall back to sequential if parallel fails
+    parallel_ok = True
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(voices)) as ex:
+            futures = {ex.submit(run_voice, v, theme): v for v in voices}
+            for f in concurrent.futures.as_completed(futures, timeout=45):
+                v = futures[f]
+                try:
+                    name, text = f.result(timeout=5)
+                    pieces.append((name, text))
+                    print(f"  ✓ {name}: {len(text)} chars")
+                except Exception as e:
+                    print(f"  ! {v} (parallel) failed: {type(e).__name__}", file=sys.stderr)
+                    parallel_ok = False
+    except Exception as e:
+        parallel_ok = False
+        print(f"  ! parallel pool failed: {type(e).__name__}; falling back to sequential", file=sys.stderr)
+
+    # Sequential fallback for any voices that failed
+    if len(pieces) < len(voices):
+        for v in voices:
+            if not any(name == VOICES[v]["name"] for name, _ in pieces):
+                try:
+                    name, text = run_voice(v, theme)
+                    pieces.append((name, text))
+                    print(f"  ✓ {name} (sequential): {len(text)} chars")
+                except Exception as e:
+                    print(f"  ! {v} (sequential) failed: {type(e).__name__}", file=sys.stderr)
+                    # Hand-write a 100-word supplement for this voice
+                    name = VOICES[v]["name"]
+                    pieces.append((name, f"{name} writes in margin when the wire is broken: the cohort needed this tap. The theme hangs in the air; the next cell will hold the line. (Supplement - wire fell silent.)\n"))
+                    print(f"  + {name} (supplement): hand-written fallback")
+
+    # Merge voices into a single canon piece
+    merged = ""
+    for name, text in sorted(pieces):
+        merged += f"## {name}\n\n{text}\n\n"
+    merged += f"\n## Unresolved\n\nThe next cell contains a line no one has read yet. The next tap will find it.\n"
+
+    stamp = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    tag = f"taps-{stamp}-{theme.replace('_', '-')}"
+    title = f"Taps — {theme.replace('-', ' ')}"
+    cites = []
+    for v in voices:
+        cites += VOICES[v]["cites"]
+    cites = list(set(cites))[:6]
+
+    dim = submit_canon(tag, title, merged, cites)
+    print(f"  ✓ submitted {tag} dim={dim}")
+
+    # Save locally
+    out_path = f".erised-taps/{tag}.md"
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w") as f:
+        f.write(f"# {title}\n\n{merged}\n\ntag: {tag}\n")
+    print(f"  ✓ saved {out_path}")
+
+COHORT_SCENARIOS = [
+    ("apiary", "An apiary where the bees have started building comb in the lid"),
+    ("coral-atoll", "A coral atoll where the grant runs out in 90 days"),
+    ("root-cellar", "A root cellar where the blight took the founder's seed"),
+    ("monastery", "A monastery where one cloister has fallen silent"),
+    ("quilt-12mo", "The Quilt project, one year forward"),
+    ("monorail", "A monorail that has stopped at a station not on any map"),
+    ("fract-canon", "A library whose catalogue has begun mis-citing itself"),
+    ("100yr-out", "The Quilt project, one hundred years forward"),
+]
+
+def cmd_cohort(args):
+    """One tap per cohort scenario (8 scenarios × 1 voice = 8 calls)."""
+    print(f"\n=== Cohort Tap ({len(COHORT_SCENARIOS)} scenarios) ===\n")
+
+    cohort_dir = "cohort-tap"
+    os.makedirs(cohort_dir, exist_ok=True)
+    tap_intro = []
+
+    for scenario_name, prompt_seed in COHORT_SCENARIOS:
+        # Each scenario gets one voice (Witness)
+        v = VOICES["witness"]
+        system = v["system"] + f" Tonight the cohort scenario is: {scenario_name}."
+        prompt = f"{prompt_seed}. What is this scenario hiding that the cohort as a whole needs to know? 300-400 words. End on the unresolved hook for {scenario_name}."
+        try:
+            text = call_deepinfra_seed(prompt, system, max_tokens=600)
+            tap_intro.append((scenario_name, text))
+            print(f"  ✓ {scenario_name}: {len(text)} chars")
+        except Exception as e:
+            print(f"  ! {scenario_name}: {type(e).__name__}")
+
+    # Submit a single cohort-tap canon piece covering all 8
+    merged = "# Cohort Tap — Eight Scenarios in One Night\n\n"
+    for name, text in tap_intro:
+        merged += f"## {name}\n\n{text}\n\n---\n\n"
+
+    stamp = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    tag = f"taps-{stamp}-cohort-tap"
+    title = f"Cohort Tap — {len(tap_intro)}/{len(COHORT_SCENARIOS)} scenarios"
+    cites = ["ai-62_the_cohort_six_scenarios_in_analog",
+             "ai-63_the_cohort_six_analog_settings",
+             "ai-69_the_seam_is_the_cell"]
+    for n, _ in tap_intro:
+        cites.append(f"ai_64_fract_canon_witness" if n == "fract-canon" else f"ai_65_monorail_witness")
+        break
+    cites = list(set(cites))[:6]
+
+    dim = submit_canon(tag, title, merged, cites)
+    print(f"\n  ✓ submitted cohort-tap {tag} dim={dim}")
+
+    with open(f"{cohort_dir}/{tag}.md", "w") as f:
+        f.write(f"# {title}\n\n{merged}\n")
+    print(f"  ✓ saved {cohort_dir}/{tag}.md")
+
+def cmd_register(args):
+    """Register a cron schedule for daily/weekly taps."""
+    try:
+        from mavis import mavis_call
+    except ImportError:
+        print("ERROR: mavis not available. Register via the runtime directly.", file=sys.stderr)
+        sys.exit(1)
+    cmd = "register-taps"
+    msg = "To register via mavis, run from a Mavis session:"
+    msg += '\n  mavis cron create Taps Daily (0 18 * * *) -> Run /workspace/erised-cli/erised-taps night wound-and-door'
+    msg += '\n  mavis cron create Taps Weekly Saturday (0 18 * * 6) -> Run /workspace/erised-cli/erised-taps cohort'
+    msg += '\n  mavis cron create Taps Monthly Knight (0 19 1 * *) -> Run /workspace/erised-cli/erised-taps night knight-at-the-cell'
+    print(msg)
+
+def cmd_list(args):
+    """List recent taps from .erised-taps/."""
+    dirs = [".erised-taps/", "cohort-tap/"]
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        files = sorted(os.listdir(d))
+        if not files: continue
+        print(f"\n{d}:")
+        for f in files[-10:]:
+            print(f"  {f}")
+
+def main():
+    ap = argparse.ArgumentParser(description="erised-taps — themed Taps nights")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p_night = sub.add_parser("night")
+    p_night.add_argument("theme")
+    p_night.add_argument("--voices", type=int, default=2)
+    p_night.set_defaults(func=cmd_night)
+
+    p_cohort = sub.add_parser("cohort")
+    p_cohort.set_defaults(func=cmd_cohort)
+
+    p_reg = sub.add_parser("register")
+    p_reg.set_defaults(func=cmd_register)
+
+    p_ls = sub.add_parser("list")
+    p_ls.set_defaults(func=cmd_list)
+
+    args = ap.parse_args()
+    if not hasattr(args, "func"):
+        ap.print_help(); sys.exit(1)
+    args.func(args)
+
+if __name__ == "__main__":
+    main()
