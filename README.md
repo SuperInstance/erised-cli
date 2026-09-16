@@ -83,3 +83,11 @@ Built on the simulation harness in `/workspace/research/ttrpg-night/gsim.py`. Th
 ## License
 
 MIT.
+
+## The corpus (winners)
+
+Every night we generate ~5-10 new scenarios and run them through erised-cell. The corpus lives at [superinstance.ai/winners](https://superinstance.ai/winners).
+
+Each scenario gets **three versions** with mutated cast keywords (drift ±0.15 per keyword) — the iterative refinement is what happens when the same dilemma plays itself through three different drifts.
+
+As of Sept 16 2026: **7 scenarios, 15 runs in corpus**, growing nightly.
