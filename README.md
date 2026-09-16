@@ -39,11 +39,33 @@ That fits inside any free tier.
 
 ## Examples
 
-Three scenarios ship in `examples/`:
+Ten scenarios ship in `examples/`:
 
 - `quick-test.json` — 2 characters, 4 rounds. Cheapest test.
 - `quilt-12mo.json` — The Quilt project, 1 year out. 4 characters.
 - `monastery.json` — Same dilemma, monastic setting.
+- `fract-canon.json` — Self-referential library.
+- `monorail.json` — Rail car with no operator.
+- `100yr-out.json` — The Quilt, 100 years forward.
+- `patron-library.json` — Community library, books by patrons.
+- `coral-atoll.json` — Floating research station over a transplant.
+- `apiary.json` — Beekeeper's legacy tended by neighbors.
+- `root-cellar.json` — Communal cellar, blight has taken the founder's seed.
+
+## erised-cell — the per-scenario directory
+
+For a scenario with lineage (multiple runs, versioned cast, run history),
+use `erised-cell`:
+
+```bash
+./erised-cell init examples/apiary.json   # creates .erised/
+cd .erised/                               # (auto-detected by walking up)
+./erised-cell run                          # produces runs/<timestamp>.json
+./erised-cell ls                           # list runs
+./erised-cell diff <run1> <run2>           # compare resonance + citations
+```
+
+See [CELL.md](CELL.md) for full docs.
 
 ## YAML support
 
