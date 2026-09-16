@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""
+erised-cell — manage .erised/ cell directories.
+
+A .erised/ directory is the per-scenario cell. It contains:
+  - scenario.json   (the input)
+  - cast/<name>.json (per-character sheets, individually trackable)
+  - runs/<timestamp>.json (output, signed by form)
+  - INDEX.md (human-readable summary)
+
+Commands:
+  init       create a .erised/ from a scenario file
+  run        run an .erised/ scenario (produces a run file)
+  diff       diff two runs
+  ls         list runs
+  index      regenerate INDEX.md
+
+A cell IS the seam. Each scenario+run history is one identity.
+"""
+import os, sys, json, argparse, time, urllib.request, urllib.error, re, datetime
+import concurrent.futures
+
+ERISED_DIR = ".erised"
+
+# --- LLM backends (same as erised, inlined) ---------------------------------
+
+def call_deepinfra(prompt, system, model="ByteDance/Seed-2.0-mini", max_tokens=600):
+    key = os.environ.get("DEEPINFRA_TOKEN") or os.environ.get("DEEP_TOKEN")
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role":"system","content":system},{"role":"user","content":prompt}],
+        "temperature": 0.95, "max_tokens": max_tokens,
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.deepinfra.com/v1/openai/chat/completions",
+        data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        d = json.loads(r.read())
+    return (d.get("choices", [{}])[0].get("message", {}).get("content")
+            or d.get("choices", [{}])[0].get("message", {}).get("reasoning_content")
+            or "[EMPTY]")
+
+def call_zai(prompt, system, model="glm-4.5", max_tokens=600):
+    key = os.environ.get("ZAI_TOKEN")
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role":"system","content":system},{"role":"user","content":prompt}],
+        "temperature": 0.85, "max_tokens": max_tokens,
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.z.ai/api/coding/paas/v4/chat/completions",
+        data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        d = json.loads(r.read())
+    return d.get("choices", [{}])[0].get("message", {}).get("content") or "[EMPTY]"
+
+def call_llm(llm_str, prompt, system, max_tokens=600):
+    if llm_str.startswith("zai:"):
+        return call_zai(prompt, system, llm_str.split(":",1)[1], max_tokens)
+    if llm_str.startswith("deepinfra:"):
+        return call_deepinfra(prompt, system, llm_str.split(":",1)[1], max_tokens)
+    return f"[ERROR: unknown LLM '{llm_str}']"
+
+# --- Keywords + shifts (same as erised) -----------------------------------
+
+def parse_keywords(s):
+    out = {}
+    if not s: return out
+    if isinstance(s, dict): return s  # already parsed
+    # Split on common separators (comma, semicolon, newline, or space-before-letter)
+    for part in re.split(r"[,\n;]+|\s+(?=[a-z])", str(s)):
+        part = part.strip()
+        if not part: continue
+        m = re.search(r"^(\S+?)([+-])\s*(\d*\.?\d+)\s*$", part)
+        if m:
+            sign = 1 if m.group(2) == "+" else -1
+            out[m.group(1).strip().lower()] = sign * float(m.group(3))
+    return out
+
+def score_shifts(text, keywords):
+    if isinstance(keywords, dict):
+        shift_map = keywords
+    else:
+        shift_map = parse_keywords(keywords)
+    shifts, total = {}, 0.0
+    lower = text.lower()
+    for w, s in shift_map.items():
+        cnt = len(re.findall(r"\b"+re.escape(w)+r"\b", lower))
+        if cnt > 0:
+            shifts[w] = round(s*cnt, 3); total += s*cnt
+    return shifts, round(total, 3)
+
+# --- Prompts (same as erised) ----------------------------------------------
+
+def sys_character(c):
+    return f"You are {c['name']}. {c.get('tendencies','')}. Output a single in-character utterance (2-4 sentences) followed by a single in-character action in brackets like [climbs the boom]. NEVER reason out loud. NEVER explain your process."
+
+def sys_dm():
+    return "You are a tight maritime-fantasy game-master. Output ONLY in-character GM narration. NEVER reason out loud. NEVER explain your process. NEVER invent cast members not given to you."
+
+def user_character(setting, history, tick):
+    recent = []
+    for h in history[-6:]:
+        if "turns" in h:
+            for t in h["turns"]:
+                recent.append(f"[{t['name']}]: {(t.get('text','')[:200])}")
+        else:
+            recent.append(f"[DM]: {h.get('text','')[:200]}")
+    return f"Round {tick}.\n\nSetting: {setting}\n\nPrior turns:\n" + "\n".join(recent) + "\n\nYour move. Speak + action."
+
+def user_dm_open(setting, cast):
+    names = ", ".join(c["name"] for c in cast)
+    return f"Open the night. In 3-4 sentences: who's here, what's the immediate problem, what do they need to do in the next hour. End with a question or call to action.\n\nSetting: {setting}\n\nCast: {names}\n\nOutput ONLY prose."
+
+def user_dm_close(recent_turns):
+    return f"What just happened:\n{recent_turns}\n\nEnd the session in 2-3 sentences: what was resolved, what carries over, what's next session's hook. End on an unresolved thread. Output ONLY the GM narration."
+
+# --- Cell operations -------------------------------------------------------
+
+def find_cell(start_dir="."):
+    """Walk up to find .erised/ directory."""
+    d = os.path.abspath(start_dir)
+    while True:
+        candidate = os.path.join(d, ERISED_DIR)
+        if os.path.isdir(candidate):
+            return candidate
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+def load_scenario(cell_dir):
+    """Load scenario.json from a cell."""
+    with open(os.path.join(cell_dir, "scenario.json")) as f:
+        if yaml := __import__("importlib").import_module("yaml") if False else None:
+            pass  # not used, just to silence
+    raw = open(os.path.join(cell_dir, "scenario.json")).read()
+    import json
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # try yaml
+        try:
+            import yaml
+            return yaml.safe_load(raw)
+        except ImportError:
+            raise SystemExit("ERROR: scenario.json is not valid JSON (and pyyaml missing)")
+
+def cmd_init(args):
+    """Initialize a .erised/ cell from a scenario file."""
+    target = args.path or ERISED_DIR
+    if os.path.exists(target):
+        print(f"ERROR: {target} already exists", file=sys.stderr)
+        sys.exit(1)
+    if not args.scenario:
+        print("ERROR: scenario file required", file=sys.stderr)
+        sys.exit(1)
+
+    os.makedirs(target, exist_ok=True)
+    os.makedirs(os.path.join(target, "cast"), exist_ok=True)
+    os.makedirs(os.path.join(target, "runs"), exist_ok=True)
+
+    # Load scenario
+    raw = open(args.scenario).read()
+    scenario = None
+    try:
+        scenario = json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            import yaml
+            scenario = yaml.safe_load(raw)
+        except ImportError:
+            pass
+    if scenario is None:
+        print("ERROR: could not parse scenario", file=sys.stderr)
+        sys.exit(1)
+
+    # Write scenario.json (canonical form)
+    with open(os.path.join(target, "scenario.json"), "w") as f:
+        json.dump(scenario, f, indent=2)
+
+    # Per-character sheets
+    for c in scenario.get("characters", []):
+        sheet = {
+            "name": c["name"],
+            "role": c.get("role", ""),
+            "llm": c.get("llm", "deepinfra:ByteDance/Seed-2.0-mini"),
+            "tendencies": c.get("tendencies", ""),
+            "keywords": parse_keywords(c.get("keywords", "")),
+            "ticks": c.get("ticks", 20),
+            "version": 1,
+            "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "history": [],
+        }
+        with open(os.path.join(target, "cast", f"{c['name'].lower().replace(' ', '_')}.json"), "w") as f:
+            json.dump(sheet, f, indent=2)
+
+    # INDEX.md
+    write_index(target, scenario)
+    print(f"  ✓ initialized {target}/")
+    print(f"    - scenario.json + {len(scenario.get('characters',[]))} cast sheets")
+    print(f"    - next: ./erised-cell run")
+
+def write_index(cell_dir, scenario):
+    """Generate INDEX.md summarizing the cell."""
+    cell_name = os.path.basename(os.path.abspath(cell_dir))
+    lines = [
+        f"# {scenario.get('title', cell_name)}",
+        "",
+        f"> erised cell · initialized {datetime.datetime.utcnow().strftime('%Y-%m-%d')}",
+        "",
+        "## Setting",
+        "",
+        scenario.get("setting", "_(no setting)_"),
+        "",
+        "## Cast",
+        "",
+    ]
+    for c in scenario.get("characters", []):
+        kw = parse_keywords(c.get("keywords",""))
+        lines.append(f"- **{c['name']}** ({c.get('llm','?')})")
+        lines.append(f"  - {c.get('tendencies','')[:120]}")
+        if kw:
+            kw_display = ", ".join(f"{k}{'+' if v>=0 else ''}{v}" for k, v in list(kw.items())[:4])
+            lines.append(f"  - keywords: {kw_display}...")
+        lines.append("")
+    lines.extend([
+        "## Run history",
+        "",
+        "_No runs yet. Run `./erised-cell run` to create one._",
+        "",
+        "## Commands",
+        "",
+        "```",
+        f"./erised-cell run               # produce runs/<timestamp>.json",
+        f"./erised-cell ls                  # list runs",
+        f"./erised-cell diff <run1> <run2> # compare resonance + citations",
+        f"./erised-cell index               # regenerate this file",
+        "```",
+        "",
+    ])
+    with open(os.path.join(cell_dir, "INDEX.md"), "w") as f:
+        f.write("\n".join(lines))
+
+def cmd_run(args):
+    """Run the scenario in this cell."""
+    cell_dir = find_cell()
+    if not cell_dir:
+        print("ERROR: no .erised/ directory found", file=sys.stderr)
+        sys.exit(1)
+    scenario = load_scenario(cell_dir)
+    cast = scenario.get("characters", [])
+    setting = scenario.get("setting", "")
+    rounds = args.rounds
+    title = scenario.get("title", "Untitled cell")
+    print(f"=== Running {title} in {cell_dir} ===\n")
+
+    history = []
+    dm_open = call_zai(user_dm_open(setting, cast), sys_dm(), max_tokens=500)
+    print(f"[DM]: {dm_open}\n")
+    history.append({"tick": 1, "turns": [{"name":"DM","text":dm_open, "role":"DM"}]})
+
+    resonance = {c["name"]: 0.0 for c in cast}
+    citations = {}
+
+    for r in range(rounds - 1):
+        tick = r + 2
+        print(f"--- Round {tick} ---")
+        def run_char(c):
+            text = call_llm(c.get("llm","deepinfra:ByteDance/Seed-2.0-mini"),
+                            user_character(setting, history, tick), sys_character(c))
+            keywords = parse_keywords(c.get("keywords",""))
+            shifts, total = score_shifts(text, keywords)
+            return {"name": c["name"], "text": text, "shifts": shifts,
+                    "shift_total": total, "role": c.get("role","")}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(cast)) as ex:
+            turns = list(ex.map(run_char, cast))
+
+        for t in turns:
+            print(f"\n[{t['name']}]: {t['text']}")
+            if t['shifts']:
+                sh = ', '.join(f"{k}={v:+.2f}" for k,v in t['shifts'].items())
+                print(f"    shifts: {sh} (net {t['shift_total']:+.2f})")
+            resonance[t['name']] = resonance.get(t['name'], 0.0) + t['shift_total']
+            lower = t['text'].lower()
+            for other in cast:
+                if other['name'] == t['name']: continue
+                n = other['name'].lower().split()[0]
+                cnt = lower.count(n)
+                if cnt > 0:
+                    citations.setdefault(t['name'], {}).setdefault(other['name'], 0)
+                    citations[t['name']][other['name']] += cnt
+        history.append({"tick": tick, "turns": turns})
+        print()
+
+    last = history[-1]
+    recent = "\n\n".join(f"[{t['name']}]: {t['text']}" for t in last.get("turns", []))
+    closing = call_zai(user_dm_close(recent), sys_dm(), max_tokens=500)
+    print(f"\n[DM closing]: {closing}\n")
+
+    # Save the run
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    run_path = os.path.join(cell_dir, "runs", f"{timestamp}.json")
+    result = {
+        "title": title,
+        "rounds": rounds,
+        "ran_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "ran_by": "erised-cell v0.1.0",
+        "history": history,
+        "resonance": resonance,
+        "citations": citations,
+        "dm_opening": history[0]["turns"][0]["text"],
+        "dm_closing": closing,
+    }
+    with open(run_path, "w") as f:
+        json.dump(result, f, indent=2, default=str)
+    print(f"  ✓ saved {run_path}")
+
+    # Update cast sheets with delta
+    for c_name, delta in resonance.items():
+        sheet_path = os.path.join(cell_dir, "cast",
+                                  f"{c_name.lower().replace(' ', '_')}.json")
+        if os.path.exists(sheet_path):
+            with open(sheet_path) as f:
+                sheet = json.load(f)
+            sheet["history"].append({
+                "run": timestamp,
+                "delta_resonance": delta,
+                "citations_in": citations.get(c_name, {}),
+                "citations_out": {other: citations.get(other, {}).get(c_name, 0)
+                                  for other in resonance},
+            })
+            sheet["version"] = sheet.get("version", 1) + 1
+            with open(sheet_path, "w") as f:
+                json.dump(sheet, f, indent=2)
+
+    # Regenerate INDEX.md
+    write_index(cell_dir, scenario)
+
+def cmd_ls(args):
+    cell_dir = find_cell()
+    if not cell_dir:
+        print("ERROR: no .erised/ directory found", file=sys.stderr)
+        sys.exit(1)
+    runs_dir = os.path.join(cell_dir, "runs")
+    if not os.path.isdir(runs_dir):
+        print("(no runs)")
+        return
+    runs = sorted(os.listdir(runs_dir))
+    print(f"\nRuns in {cell_dir}:")
+    for r in runs:
+        path = os.path.join(runs_dir, r)
+        if r.endswith(".json"):
+            try:
+                d = json.load(open(path))
+                title = d.get("title", "?")
+                rounds = d.get("rounds", "?")
+                ran_at = d.get("ran_at", "?")[:19]
+                res = ", ".join(f"{k}={v:+.2f}" for k,v in d.get("resonance",{}).items())
+                print(f"  {r[:-5]:18}  {ran_at}  R={rounds}  resonance: {res}")
+            except: print(f"  {r}")
+
+def cmd_diff(args):
+    cell_dir = find_cell()
+    if not cell_dir:
+        print("ERROR: no .erised/ directory found", file=sys.stderr)
+        sys.exit(1)
+    runs_dir = os.path.join(cell_dir, "runs")
+    a_path = os.path.join(runs_dir, args.run1 + (".json" if not args.run1.endswith(".json") else ""))
+    b_path = os.path.join(runs_dir, args.run2 + (".json" if not args.run2.endswith(".json") else ""))
+    if not (os.path.exists(a_path) and os.path.exists(b_path)):
+        print("ERROR: run file(s) not found", file=sys.stderr)
+        sys.exit(1)
+    a = json.load(open(a_path))
+    b = json.load(open(b_path))
+
+    print(f"\nDiff: {args.run1} vs {args.run2}\n")
+
+    print("Resonance (a → b):")
+    keys = set(a.get("resonance",{}).keys()) | set(b.get("resonance",{}).keys())
+    for k in sorted(keys):
+        ra = a.get("resonance",{}).get(k, 0.0)
+        rb = b.get("resonance",{}).get(k, 0.0)
+        delta = rb - ra
+        sym = "↗" if delta > 0.01 else ("↘" if delta < -0.01 else "·")
+        print(f"  {sym} {k:18}  {ra:+.2f} → {rb:+.2f}  (Δ {delta:+.2f})")
+
+    print("\nCitations (a → b):")
+    a_cites = json.dumps(a.get("citations",{}), sort_keys=True)
+    b_cites = json.dumps(b.get("citations",{}), sort_keys=True)
+    if a_cites == b_cites:
+        print("  (identical)")
+    else:
+        print(f"  a: {a_cites[:200]}")
+        print(f"  b: {b_cites[:200]}")
+
+    print("\nDM closings (a | b):")
+    print(f"  a: {a.get('dm_closing','')[:200]}")
+    print(f"  b: {b.get('dm_closing','')[:200]}")
+
+def cmd_index(args):
+    cell_dir = find_cell()
+    if not cell_dir:
+        print("ERROR: no .erised/ directory found", file=sys.stderr)
+        sys.exit(1)
+    scenario = load_scenario(cell_dir)
+    write_index(cell_dir, scenario)
+    print(f"  ✓ regenerated INDEX.md")
+
+def main():
+    ap = argparse.ArgumentParser(description="erised-cell — manage .erised/ cell directories")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p_init = sub.add_parser("init")
+    p_init.add_argument("scenario", nargs="?", help="path to scenario file")
+    p_init.add_argument("--path", help="target dir (default: .erised/)")
+    p_init.set_defaults(func=cmd_init)
+
+    p_run = sub.add_parser("run")
+    p_run.add_argument("--rounds", type=int, default=4)
+    p_run.set_defaults(func=cmd_run)
+
+    p_ls = sub.add_parser("ls")
+    p_ls.set_defaults(func=cmd_ls)
+
+    p_diff = sub.add_parser("diff")
+    p_diff.add_argument("run1")
+    p_diff.add_argument("run2")
+    p_diff.set_defaults(func=cmd_diff)
+
+    p_index = sub.add_parser("index")
+    p_index.set_defaults(func=cmd_index)
+
+    args = ap.parse_args()
+    if not hasattr(args, "func"):
+        ap.print_help(); sys.exit(1)
+    args.func(args)
+
+if __name__ == "__main__":
+    main()
